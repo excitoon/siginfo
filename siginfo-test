@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+
+import argparse
+import difflib
+import fnmatch
+import glob
+import os
+import subprocess
+import sys
+import tempfile
+
+import binary
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('path', type=str, nargs='+', help='path to search for signature files')
+parser.add_argument('--debug', action='store_true', help='debugging mode')
+parser.add_argument('--precise', action='store_true', help='test precisely')
+parser.add_argument('--version', type=int, nargs='?', help='version filter')
+args = parser.parse_args()
+
+def get_script_path():
+    return os.path.dirname(os.path.realpath(sys.argv[0]))
+
+files = {}
+
+for path in args.path:
+    if os.path.isfile(path):
+        files[path] = {}
+    else:
+        for root, dirnames, filenames in os.walk(path):
+            for filename in filenames:
+                if fnmatch.fnmatch(filename, '*.sig'):
+                    files[os.path.join(root, filename)] = {}
+
+versions = {}
+
+for name in files:
+    bytes = open(name, 'rb').read()
+    assert binary.read_block(bytes, 0, 6) == b'IDASGN'
+    version = binary.read_byte(bytes, 6)
+    files[name]['version'] = version
+    versions[version] = set()
+
+for name in files:
+    if args.version is None or files[name]['version'] == args.version:
+        if args.precise:
+            try:
+                reference_tree_file = tempfile.NamedTemporaryFile()
+                reference_tree_file.close()
+                reference_cmd = ['dumpsig', name, reference_tree_file.name]
+                reference_process = subprocess.run(reference_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, universal_newlines=True)
+                reference_code = reference_process.returncode
+                if reference_code == 0:
+                    reference_tree = open(reference_tree_file.name, 'r', encoding='ascii', errors='ignore')
+                    reference_content = reference_process.stdout
+                    if not reference_tree.closed:
+                        reference_content += reference_tree.read()
+                        reference_tree.close()
+                    cmd = [get_script_path() + '/siginfo', name, '--text', '--skip-greeting']
+                    process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, universal_newlines=True)
+                    code = process.returncode
+                    if code == 0:
+                        content = process.stderr + process.stdout
+                        if content != reference_content:
+                            code = 5000
+                            if args.debug:
+                                def only_differences(line):
+                                    return line.startswith('-') or line.startswith('+')
+                                diff = '\n'.join(filter(only_differences, difflib.Differ().compare(reference_content.splitlines(), content.splitlines())))
+                                print(diff)
+                else:
+                    code = 10000 + reference_code
+            except:
+                pass
+            finally:
+                try:
+                    os.unlink(reference_tree_file.name)
+                except:
+                    pass
+        else:
+            cmd = [get_script_path() + '/siginfo', name, '--quiet']
+            code = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, universal_newlines=True).returncode
+        files[name]['result'] = code
+        versions[files[name]['version']] |= set([code])
+    else:
+        files[name]['result'] = -1
+    if args.debug:
+        print(name, files[name]['result'])
+        if files[name]['result'] > 0:
+            sys.exit(1)
+
+for version in sorted(versions):
+    print('Version %d: %s' % (version, sorted(versions[version])))
+
+failed = len(list(filter(lambda x: x['result'] > 0, files.values())))
+total = len(list(filter(lambda x: x['result'] >= 0, files.values())))
+print('%d out of %d signature files failed:' % (failed, total) if failed > 0 else 'Everything is fine.')
+
+for count, (name, file_result) in enumerate(filter(lambda x: x[1]['result'] > 0, files.items())):
+    print('%s, version=%d' % (name, file_result['version']))
+    if count == 9:
+        print('etc.')
+        break

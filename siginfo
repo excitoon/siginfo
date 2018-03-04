@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import sys
+import zlib
+
+import binary
+import misc
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('path', type=str, help='path to signature file')
+parser.add_argument('--debug', action='store_true', help='debugging mode')
+parser.add_argument('--quiet', action='store_true', help='skip output')
+parser.add_argument('--skip-greeting', action='store_true', help='skip greeting')
+parser.add_argument('--text', action='store_true', help='text output')
+args = parser.parse_args()
+
+bytes = open(args.path, 'rb').read()
+
+info = {}
+
+pipe = binary.Pipe(bytes)
+assert pipe.read_block(6) == b'IDASGN'
+info['version'] = pipe.read_byte()
+assert info['version'] >= 5 and info['version'] <= 10
+info['architecture'] = pipe.read_byte()
+info['file-types'] = pipe.read_dword()
+info['os-types'] = pipe.read_word()
+info['app-types'] = pipe.read_word()
+info['flags'] = pipe.read_byte()
+if info['version'] <= 5:
+    pipe.read_byte()
+    info['modules-count'] = pipe.read_word()
+else:
+    pipe.read_block(3)
+info['checksum'] = pipe.read_word()
+info['ctype'] = pipe.read_block(0xc).rstrip(b'\0').decode('ascii')
+name_size = pipe.read_byte()
+info['alternative-checksum'] = pipe.read_word()
+if info['version'] >= 6:
+    info['modules-count'] = pipe.read_dword()
+if info['version'] >= 8:
+    info['pattern-size'] = pipe.read_word()
+else:
+    info['pattern-size'] = 32
+if info['version'] >= 10:
+    info['third-checksum'] = pipe.read_word()
+else:
+    info['third-checksum'] = None
+info['name'] = pipe.read_block(name_size).decode('ascii')
+
+compressed = pipe.read_block_until_end()
+
+try:
+    data = binary.Pipe(zlib.decompress(compressed, wbits=zlib.MAX_WBITS if info['version'] >= 7 else -15) if info['flags'] & 0x10 == 0x10 else compressed)
+except zlib.error:
+    print("Failed to decompress.")
+    sys.exit(2)
+
+def print_dump(data):
+    s = ''
+    for i, b in enumerate(data):
+        s += '%.2X' % (b)
+        if i % 4 == 3:
+            s += ' '
+    s += '\n'
+    for i, b in enumerate(data):
+        if b in (8, 0x18, 0):
+            s += '  '
+        elif b == ord('\t'):
+            s += '\\t'
+        elif b == ord('\r'):
+            s += '\\r'
+        elif b == ord('\n'):
+            s += '\\n'
+        else:
+            s += ' ' + chr(b)
+        if i % 4 == 3:
+            s += ' '
+    s += '\n' + data.decode('cp1251', errors='ignore').replace('\n', ' ')
+    print(s)
+
+def read_tree(data, version, debug):
+    global ccc
+    nodes_count = data.read_packed_be_word()
+    content = { 'nodes' : [], 'modules' : [] }
+
+    if nodes_count > 0:
+        for i in range(0, nodes_count):
+            node_size = data.read_byte()
+            if debug:
+                print('node_size',node_size)
+                print_dump(data.bytes[data.offset-20:data.offset+40])
+            assert node_size <= 32
+            bits = format(data.read_packed_be_dword() if node_size >= 16 else data.read_packed_be_word(), '032b')[-node_size:]
+            pattern = []
+            for k in range(0, node_size):
+                pattern.append(None if bits[k] == '1' else data.read_byte())
+            if args.debug:
+                print(pattern)
+            content['nodes'].append({ 'pattern' : pattern, 'tree' : read_tree(data, version, debug) })
+        return content
+    else:
+        flags = 0x10
+        while flags & 0x10 == 0x10:
+            common_size = data.read_byte()
+            common_checksum = data.read_be_word()
+            flags |= 8
+
+            while flags & 8 == 8:
+                offset = 0
+                module = {}
+                module['size'] = common_size
+                module['checksum'] = common_checksum
+                module['publics'] = []
+                module['references'] = []
+                module['tails'] = []
+                if version <= 8:
+                    module['total'] = data.read_packed_be_word()
+                else:
+                    module['total'] = data.read_packed_be_dword()
+                if debug:
+                    print_dump(data.bytes[data.offset-20:data.offset+40])
+                    print('total',hex(module['total']))
+                    print('offset',data.offset)
+                flags |= 1
+
+                while flags & 1 == 1:
+                    if version >= 10:
+                        delta = data.read_packed_be_dword()
+                    else:
+                        delta = data.read_packed_be_word()
+                    name = ''
+                    is_declaration = False
+                    is_local = False
+                    is_anonymous = False
+                    is_possible = False
+                    while True:
+                        c = data.read_byte()
+                        if c < 0x20:
+                            if name == '':
+                                is_declaration = c & 1 == 1
+                                is_local = c & 2 == 2
+                                is_possible = c & 4 == 4
+                                is_anonymous = c & 8 == 8
+                                if c & 0x10 == 0x10:
+                                    delta = -delta
+                            else:
+                                flags = c
+                                break
+                        elif c < 0x80:
+                            name += chr(c)
+                    offset += delta
+                    if debug:
+                        print('name',name)
+                        print('flags',flags)
+                    module['publics'].append({ 'name' : name, 'offset' : offset, 'is-declaration' : is_declaration, 'is-local' : is_local, 'is-possible' : is_possible, 'is-anonymous' : is_anonymous })
+
+                if debug:
+                    print_dump(data.bytes[data.offset-20:data.offset+40])
+
+                if flags & 2 == 2:
+                    count = data.read_byte() if info['version'] >= 8 else 1
+                    if debug:
+                        print('count',count)
+                    for i in range(0, count):
+                        if version >= 10:
+                            offset = data.read_packed_be_dword()
+                        else:
+                            offset = data.read_packed_be_word()
+                        byte = data.read_byte()
+                        if debug:
+                            print(count,hex(offset),hex(byte))
+                        module['tails'].append({ 'offset' : offset, 'data' : byte })
+
+                if flags & 4 == 4:
+                    count = count = data.read_byte() if version >= 8 else 1
+                    assert count == 1
+                    reference_offset = data.read_packed_be_word()
+                    size = data.read_byte()
+                    if size == 0:
+                        size = data.read_packed_be_word()
+                    raw = data.read_block(size)
+                    name = raw.decode('ascii', errors='ignore')
+                    if name[-1] == '\0':
+                        reference_offset = -reference_offset
+                        name = name[:-1]
+                    if debug:
+                        print('count',count)
+                        print('ref_offset',reference_offset)
+                        print('size',size)
+                        print('reference',name)
+                    module['references'].append({ 'offset' : reference_offset, 'name' : name })
+
+                content['modules'].append(module)
+
+        return content
+
+info['tree'] = read_tree(data, info['version'], args.debug)
+
+if not args.quiet:
+    if not args.text:
+        indent = 0
+        one_line = False
+        for line in json.dumps(info, sort_keys=True, indent=0, cls=misc.PythonObjectEncoder).split('\n'):
+            if line in ('}', ']', '},', '],'):
+                indent -= 1
+            prefix = '' if one_line else '    '*indent
+            print(prefix + line, end='')
+            if line.endswith('{') or line.endswith('['):
+                indent += 1
+            if line == '"pattern": [':
+                one_line = True
+            if line in ('}', ']', '},', '],'):
+                one_line = False
+            if not one_line:
+                print()
+    else:
+        def print_greeting():
+            print('Signature file dumper by Vladimir Chebotarev. Version 1.0', file=sys.stderr)
+
+        def print_signature(info):
+            print('Signature     : %s, %d modules' % (info['name'], info['modules-count']), file=sys.stderr)
+
+        def print_version(version):
+            print('Version       : %d' % (version if version >= 7 else 7), file=sys.stderr)
+
+        def print_features(info):
+            features = []
+            if info['flags'] & 1 == 1:
+                features.append('(startup)')
+            if info['flags'] & 2 == 2:
+                features.append('(ctype=%s,crc=%.4X)' % (info['ctype'], info['checksum']))
+            if info['flags'] & 8 == 8:
+                features.append('(alt_ctype_crc=%.4X)' % (info['alternative-checksum']))
+            if info['flags'] & 0x20 == 0x20:
+                features.append('(ctype_crc_3v=%.4X)' % (info['third-checksum']))
+            if info['flags'] & 4 == 4:
+                features.append('2byte_ctype')
+            if info['flags'] & 0x10 == 0x10:
+                features.append('compressed')
+            features.append('%d-bytes patterns' % (info['pattern-size']))
+            print('Features      : %s' % (' '.join(features)), file=sys.stderr)
+
+        def print_architecture(architecture):
+            if architecture == 0:
+                name = 'Intel 80x86'
+            elif architecture == 1:
+                name = '8085, Z80'
+            elif architecture == 2:
+                name = 'Intel 860'
+            elif architecture == 3:
+                name = '8051'
+            elif architecture == 4:
+                name = 'TMS320C5x'
+            elif architecture == 5:
+                name = '6502'
+            elif architecture == 6:
+                name = 'PDP11'
+            elif architecture == 7:
+                name = 'Motorola 680x0'
+            elif architecture == 8:
+                name = 'Java'
+            elif architecture == 9:
+                name = 'Motorola 68xx'
+            elif architecture == 10:
+                name = 'SGS-Thomson ST7'
+            elif architecture == 11:
+                name = 'Motorola 68HC12'
+            elif architecture == 12:
+                name = 'MIPS'
+            elif architecture == 13:
+                name = 'Advanced RISC Machines'
+            elif architecture == 14:
+                name = 'TMS320C6x'
+            elif architecture == 15:
+                name = 'PowerPC'
+            elif architecture == 16:
+                name = 'Intel 80196'
+            elif architecture == 17:
+                name = 'Z8'
+            elif architecture == 18:
+                name = 'Hitachi SH'
+            elif architecture == 19:
+                name = 'Microsoft Visual Studio.Net'
+            elif architecture == 20:
+                name = 'Atmel 8-bit RISC processor(s)'
+            elif architecture == 21:
+                name = 'Hitachi H8/300, H8/2000'
+            elif architecture == 22:
+                name = 'Microchip\'s PIC'
+            elif architecture == 23:
+                name = 'SPARC'
+            elif architecture == 24:
+                name = 'DEC Alpha'
+            elif architecture == 25:
+                name = 'Hewlett-Packard PA-RISC'
+            elif architecture == 26:
+                name = 'Hitachi H8/500'
+            elif architecture == 27:
+                name = 'Tasking Tricore'
+            elif architecture == 28:
+                name = 'Motorola DSP5600x'
+            elif architecture == 29:
+                name = 'Siemens C166 family'
+            elif architecture == 30:
+                name = 'SGS-Thomson ST20'
+            elif architecture == 31:
+                name = 'Intel Itanium IA64'
+            elif architecture == 32:
+                name = 'Intel 960'
+            elif architecture == 33:
+                name = 'Fujistu F2MC-16'
+            elif architecture == 34:
+                name = 'TMS320C54xx'
+            elif architecture == 35:
+                name = 'TMS320C55xx'
+            elif architecture == 36:
+                name = 'Trimedia'
+            elif architecture == 37:
+                name = 'Mitsubishi 32bit RISC'
+            elif architecture == 38:
+                name = 'NEC 78K0'
+            elif architecture == 39:
+                name = 'NEC 78K0S'
+            elif architecture == 40:
+                name = 'Mitsubishi 8bit'
+            elif architecture == 41:
+                name = 'Mitsubishi 16bit'
+            elif architecture == 42:
+                name = 'ST9+'
+            elif architecture == 43:
+                name = 'Fujitsu FR Family'
+            elif architecture == 44:
+                name = 'Motorola 68HC16'
+            elif architecture == 45:
+                name = 'Mitsubishi 7900'
+            else:
+                name = '?? UNKNOWN ??'
+            print('Processor id  : %d %s' % (architecture, name), file=sys.stderr)
+
+        def print_os_types(flags):
+            types = []
+            if flags & 1 == 1:
+                types.append('MSDOS')
+            if flags & 2 == 2:
+                types.append('WIN')
+            if flags & 4 == 4:
+                types.append('OS/2')
+            if flags & 8 == 8:
+                types.append('NETWARE')
+            if flags & 0x10 == 0x10:
+                types.append('UNIX')
+            print('OS types      : %.4X%s' % (flags, ''.join(map(lambda x: ' '+x, types))), file=sys.stderr)
+
+        def print_app_types(flags):
+            types = []
+            if flags & 1 == 1:
+                types.append('CONSOLE')
+            if flags & 2 == 2:
+                types.append('GRAPHICS')
+            if flags & 4 == 4:
+                types.append('EXE')
+            if flags & 8 == 8:
+                types.append('DLL')
+            if flags & 0x10 == 0x10:
+                types.append('DRV')
+            if flags & 0x20 == 0x20:
+                types.append('SINGLE-THREADED')
+            if flags & 0x40 == 0x40:
+                types.append('MULTI-THREADED')
+            if flags & 0x80 == 0x80:
+                types.append('16BIT')
+            if flags & 0x100 == 0x100:
+                types.append('32BIT')
+            if flags & 0x200 == 0x200:
+                types.append('64BIT')
+            print('App types     : %.4X%s' % (flags, ''.join(map(lambda x: ' '+x, types))), file=sys.stderr)
+
+        def print_file_types(flags):
+            types = []
+            if flags & 1 == 1:
+                types.append('DOSEXE(OLD)')
+            if flags & 2 == 2:
+                types.append('DOSCOM(OLD)')
+            if flags & 4 == 4:
+                types.append('BIN')
+            if flags & 8 == 8:
+                types.append('DOSDRV')
+            if flags & 0x10 == 0x10:
+                types.append('NE')
+            if flags & 0x20 == 0x20:
+                types.append('INTELHEX')
+            if flags & 0x40 == 0x40:
+                types.append('MOSHEX')
+            if flags & 0x80 == 0x80:
+                types.append('LX')
+            if flags & 0x100 == 0x100:
+                types.append('LE')
+            if flags & 0x200 == 0x200:
+                types.append('NLM')
+            if flags & 0x400 == 0x400:
+                types.append('COFF')
+            if flags & 0x800 == 0x800:
+                types.append('PE')
+            if flags & 0x1000 == 0x1000:
+                types.append('OMF')
+            if flags & 0x2000 == 0x2000:
+                types.append('SREC')
+            if flags & 0x4000 == 0x4000:
+                types.append('ZIP')
+            if flags & 0x8000 == 0x8000:
+                types.append('OMFLIB')
+            if flags & 0x10000 == 0x10000:
+                types.append('AR')
+            if flags & 0x20000 == 0x20000:
+                types.append('LOADER')
+            if flags & 0x40000 == 0x40000:
+                types.append('ELF')
+            if flags & 0x80000 == 0x80000:
+                types.append('W32RUN')
+            if flags & 0x100000 == 0x100000:
+                types.append('AOUT')
+            if flags & 0x200000 == 0x200000:
+                types.append('PILOT')
+            if flags & 0x400000 == 0x400000:
+                types.append('DOSEXE')
+            if flags & 0x800000 == 0x800000:
+                types.append('DOSCOM')
+            if flags & 0x1000000 == 0x1000000:
+                types.append('AIXAR')
+            print('File types    : %.8X%s' % (flags, ''.join(map(lambda x: ' '+x, types))), file=sys.stderr)
+
+        def print_flags(flags):
+            print('Flags         : %.4X' % (flags), file=sys.stderr)
+
+        def print_tree(tree, level=0):
+            prefix = '  ' * level
+            for node in tree['nodes']:
+                if 'pattern' in node:
+                    print(prefix, end='')
+                    pattern = node['pattern']
+                    for byte in pattern:
+                        if byte is None:
+                            print('..', end='')
+                        else:
+                            print('%.2X' % (byte), end='')
+                    print(':')
+                if 'tree' in node:
+                    print_tree(node['tree'], level + 1)
+            for number, module in enumerate(tree['modules']):
+                print(prefix, end='')
+                format = '%d. %.2X %.4X %.8X' if module['total'] >= 0x10000 else '%d. %.2X %.4X %.4X'
+                print(format % (number, module['size'], module['checksum'], module['total']), end='')
+                for name in module['publics']:
+                    def format_specials(name):
+                        flag_set = ''
+                        for letter, flag in [('d', name['is-declaration']), ('l', name['is-local']), ('?', name['is-possible']), ('!', name['is-anonymous'])]:
+                            if flag:
+                                flag_set += letter
+                        if len(flag_set) > 0:
+                            flag_set = '(%s)' % (flag_set)
+                        return flag_set
+                    print(' %s%.4X:%s' % (format_specials(name), name['offset'], name['name']), end='')
+                for tail in module['tails']:
+                    print(' (%.4X: %.2X)' % (tail['offset'], tail['data']), end='')
+                for reference in module['references']:
+                    print(' (REF %.4X: %s)' % (reference['offset'], reference['name']), end='')
+                print()
+
+        if not args.skip_greeting:
+            print_greeting()
+        print_signature(info)
+        print_version(info['version'])
+        print_features(info)
+        print_architecture(info['architecture'])
+        print_os_types(info['os-types'])
+        print_app_types(info['app-types'])
+        print_file_types(info['file-types'])
+        print_flags(info['flags'])
+        print_tree(info['tree'])
